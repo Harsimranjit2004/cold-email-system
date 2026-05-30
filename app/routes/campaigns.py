@@ -46,7 +46,8 @@ async def create_campaign(data: CampaignCreate):
     result = db.table("campaigns").insert({
         "name": data.name,
         "status": "draft",
-        "follow_up_days": data.follow_up_days
+        "follow_up_days": data.follow_up_days,
+        "resume_filename": data.resume_filename  # ← this must be here
     }).execute()
     return result.data[0]
 
