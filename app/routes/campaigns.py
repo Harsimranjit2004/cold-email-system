@@ -16,6 +16,7 @@ router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 class CampaignCreate(BaseModel):
     name: str
     follow_up_days: list[int] = [3, 7]
+    resume_filename: Optional[str] = None
 
 
 class AddLeadsToCampaign(BaseModel):
