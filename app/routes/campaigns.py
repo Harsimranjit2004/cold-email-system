@@ -1,9 +1,10 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from app.db.database import get_db
+from app.models.campaign import CampaignCreate, DEFAULT_SEQUENCE
 from app.services.ai import personalize_email
 from app.services.gmail import send_email
 
@@ -13,42 +14,58 @@ router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 # ---------- Models ----------
 
-class CampaignCreate(BaseModel):
-    name: str
-    follow_up_days: list[int] = [3, 7]
-    resume_filename: Optional[str] = None
-
-
 class AddLeadsToCampaign(BaseModel):
     lead_ids: list[str]
-    schedule_start: Optional[str] = None  # ISO datetime, defaults to now
-    attach_resume: bool = False            # attach resume to this email
+    schedule_start: Optional[str] = None   # ISO datetime, defaults to now
 
 
 class ApproveEmail(BaseModel):
     email_id: str
     subject: Optional[str] = None
     body: Optional[str] = None
-    scheduled_at: Optional[str] = None    # override send time e.g. "2026-05-30T09:00:00"
-    attach_resume: Optional[bool] = None  # override resume attachment
+    scheduled_at: Optional[str] = None
+    attach_resume: Optional[bool] = None
 
 
 class SendNowRequest(BaseModel):
     attach_resume: bool = False
-    scheduled_at: Optional[str] = None   # if set, schedules instead of sending now
+    scheduled_at: Optional[str] = None
+
+
+# ---------- Helpers ----------
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _default_sequence_dicts():
+    return [s.model_dump() for s in DEFAULT_SEQUENCE]
+
+
+def _step_config(sequence: list[dict], step: int) -> dict:
+    for s in sequence:
+        if s.get("step") == step:
+            return s
+    return {}
 
 
 # ---------- Routes ----------
 
 @router.post("/")
 async def create_campaign(data: CampaignCreate):
-    """Create a new campaign."""
+    """Create a campaign with a per-step sequence."""
     db = get_db()
+
+    sequence = [s.model_dump() for s in (data.sequence or DEFAULT_SEQUENCE)]
+    # keep follow_up_days populated for older UI bits that still read it
+    follow_up_days = [s["delay_days"] for s in sequence if s["step"] > 1]
+
     result = db.table("campaigns").insert({
         "name": data.name,
         "status": "draft",
-        "follow_up_days": data.follow_up_days,
-        "resume_filename": data.resume_filename  # ← this must be here
+        "sequence": sequence,
+        "follow_up_days": follow_up_days,
+        "resume_filename": data.resume_filename,
     }).execute()
     return result.data[0]
 
@@ -81,19 +98,24 @@ async def get_campaign(campaign_id: str):
 @router.post("/{campaign_id}/leads")
 async def add_leads_to_campaign(campaign_id: str, data: AddLeadsToCampaign):
     """
-    Add leads to campaign.
-    AI generates preview email per lead saved as pending_approval.
-    attach_resume=True will attach your PDF resume to these emails.
+    Add leads to a campaign and generate the step-1 email per lead
+    (saved as pending_approval). Whether step 1 attaches a resume is
+    decided by the campaign's sequence — not by this request.
     """
     db = get_db()
 
     campaign = db.table("campaigns").select("*").eq("id", campaign_id).execute()
     if not campaign.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = campaign.data[0]
 
-    start_time = datetime.utcnow()
+    sequence = campaign.get("sequence") or _default_sequence_dicts()
+    step1 = _step_config(sequence, 1)
+
+    start_time = _now()
     if data.schedule_start:
         start_time = datetime.fromisoformat(data.schedule_start)
+    start_time = start_time + timedelta(days=int(step1.get("delay_days", 0)))
 
     previews = []
 
@@ -132,7 +154,7 @@ async def add_leads_to_campaign(campaign_id: str, data: AddLeadsToCampaign):
                 "status": "pending_approval",
                 "sequence_step": 1,
                 "scheduled_at": start_time.isoformat(),
-                "attach_resume": data.attach_resume
+                "attach_resume": bool(step1.get("attach_resume", False)),
             }).execute()
 
             previews.append({
@@ -170,10 +192,7 @@ async def get_pending_approvals(campaign_id: str):
 
 @router.post("/approve/{email_id}")
 async def approve_email(email_id: str, data: ApproveEmail):
-    """
-    Approve an email before sending.
-    Optionally override subject, body, scheduled time, or resume attachment.
-    """
+    """Approve an email before sending. Optionally override fields."""
     db = get_db()
 
     email = db.table("emails").select("*").eq("id", email_id).execute()
@@ -208,11 +227,7 @@ async def approve_all_emails(campaign_id: str):
 
 @router.post("/send-now/{email_id}")
 async def send_email_now(email_id: str, data: SendNowRequest = SendNowRequest()):
-    """
-    Send a single email immediately or schedule it for a specific time.
-    attach_resume=True attaches your PDF resume.
-    scheduled_at=ISO datetime schedules instead of sending now.
-    """
+    """Send a single email immediately or schedule it for a specific time."""
     db = get_db()
 
     email = db.table("emails").select("*, leads(*)").eq("id", email_id).execute()
@@ -225,7 +240,6 @@ async def send_email_now(email_id: str, data: SendNowRequest = SendNowRequest())
     if not lead or not lead.get("email"):
         raise HTTPException(status_code=400, detail="Lead has no email address")
 
-    # If scheduled_at provided, just update the record and return
     if data.scheduled_at:
         db.table("emails").update({
             "status": "pending",
@@ -234,7 +248,6 @@ async def send_email_now(email_id: str, data: SendNowRequest = SendNowRequest())
         }).eq("id", email_id).execute()
         return {"message": f"Email scheduled for {data.scheduled_at}"}
 
-    # Get thread ID for follow-ups
     thread_id = None
     if email["sequence_step"] > 1:
         first = db.table("emails")\
@@ -246,7 +259,6 @@ async def send_email_now(email_id: str, data: SendNowRequest = SendNowRequest())
             thread_id = first.data[0].get("gmail_thread_id")
 
     try:
-        # Get resume filename from campaign if attach_resume is True
         resume_filename = None
         if data.attach_resume or email.get("attach_resume", False):
             campaign = db.table("campaigns").select("resume_filename").eq("id", email["campaign_id"]).execute()
@@ -264,7 +276,7 @@ async def send_email_now(email_id: str, data: SendNowRequest = SendNowRequest())
 
         db.table("emails").update({
             "status": "sent",
-            "sent_at": datetime.utcnow().isoformat(),
+            "sent_at": _now().isoformat(),
             "gmail_message_id": result["gmail_message_id"],
             "gmail_thread_id": result["gmail_thread_id"],
         }).eq("id", email_id).execute()
